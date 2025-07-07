@@ -1,4 +1,3 @@
-forex.py
 import pandas as pd
 import numpy as np
 from backtesting import Backtest, Strategy
@@ -26,14 +25,15 @@ def load_and_prepare_data(csv_path):
     df = df.astype({"Open": float, "High": float, "Low": float, "Close": float, "Volume": int})
     return df
 
-# --- 2. The "Adaptive Volatility Breakout" Strategy ---
+# --- 2. The "Improved Adaptive Volatility Breakout" Strategy ---
 
-class AdaptiveBreakoutStrategy(Strategy):
+class ImprovedAdaptiveBreakoutStrategy(Strategy):
     """
-    A strategy that trades breakouts from low-volatility "squeezes".
+    A modified strategy that trades breakouts from low-volatility "squeezes".
     - It identifies squeezes using Bollinger Bands and Keltner Channels.
-    - It uses MACD to confirm momentum in the direction of the breakout.
-    - It adapts its take-profit target based on recent win/loss streaks.
+    - It uses MACD and a new RSI filter to confirm momentum and avoid over-extended entries.
+    - It uses a wider base risk-reward ratio.
+    - It adapts its take-profit target more simply based on win streaks.
     """
     # --- Strategy Parameters ---
     bb_period = 20
@@ -44,9 +44,12 @@ class AdaptiveBreakoutStrategy(Strategy):
     macd_fast = 12
     macd_slow = 26
     macd_signal = 9
+    rsi_period = 14
 
-    base_sl_atr = 2.0
-    base_tp_atr = 2.0
+    ### MODIFICATION ###
+    # Increased the base Take-Profit to aim for a 2:1 risk-reward ratio.
+    base_sl_atr = 1.5
+    base_tp_atr = 3.0
 
     # --- Self-Contained Indicator Helper Functions ---
     def EMA(self, data, period):
@@ -59,6 +62,13 @@ class AdaptiveBreakoutStrategy(Strategy):
         df_atr['l_pc'] = abs(df['Low'] - df['Close'].shift())
         tr = df_atr[['h_l', 'h_pc', 'l_pc']].max(axis=1)
         return self.EMA(tr, period)
+
+    def RSI(self, data, period):
+        delta = pd.Series(data).diff()
+        gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
 
     def BANDS(self, data, period, std_dev):
         sma = pd.Series(data).rolling(period).mean()
@@ -86,8 +96,11 @@ class AdaptiveBreakoutStrategy(Strategy):
         self.kc_upper, self.kc_lower = self.I(self.KELTNER, self.data.df, self.kc_period, self.kc_atr_multiplier)
         self.macd_line, self.macd_signal_line = self.I(self.MACD, self.data.Close, self.macd_fast, self.macd_slow, self.macd_signal)
         self.atr = self.I(self.ATR, self.data.df, self.atr_period)
+        ### MODIFICATION ###
+        # Added RSI indicator
+        self.rsi = self.I(self.RSI, self.data.Close, self.rsi_period)
 
-        self.trade_history = []
+        self.win_streak = 0
 
     def next(self):
         if self.position:
@@ -95,40 +108,46 @@ class AdaptiveBreakoutStrategy(Strategy):
 
         price = self.data.Close[-1]
         atr_value = self.atr[-1]
+        rsi_value = self.rsi[-1]
 
         # --- Adaptive Risk Logic ---
         tp_multiplier = self.base_tp_atr
-        if len(self.trade_history) >= 2:
-            if all(res == 1 for res in self.trade_history):
-                tp_multiplier = 3.0  # Widen TP after 2 wins
-            elif all(res == -1 for res in self.trade_history):
-                tp_multiplier = 1.0  # Tighten TP after 2 losses
+        ### MODIFICATION ###
+        # Simplified the adaptive logic to only reward winning streaks.
+        if self.win_streak >= 2:
+            tp_multiplier = 4.0  # Widen TP even further after 2 wins
 
         # --- Squeeze Condition ---
         squeeze_on = (self.bb_lower[-1] > self.kc_lower[-1]) and (self.bb_upper[-1] < self.kc_upper[-1])
 
         if squeeze_on:
+            ### MODIFICATION ###
+            # Added RSI filter to avoid buying into overbought conditions.
             # --- LONG ENTRY: Breakout above upper band with bullish momentum ---
-            if price > self.bb_upper[-1] and self.macd_line[-1] > self.macd_signal_line[-1]:
+            if price > self.bb_upper[-1] and self.macd_line[-1] > self.macd_signal_line[-1] and rsi_value < 70:
                 sl = price - atr_value * self.base_sl_atr
                 tp = price + atr_value * tp_multiplier
                 self.buy(sl=sl, tp=tp)
 
+            ### MODIFICATION ###
+            # Added RSI filter to avoid selling into oversold conditions.
             # --- SHORT ENTRY: Breakout below lower band with bearish momentum ---
-            elif price < self.bb_lower[-1] and self.macd_line[-1] < self.macd_signal_line[-1]:
+            elif price < self.bb_lower[-1] and self.macd_line[-1] < self.macd_signal_line[-1] and rsi_value > 30:
                 sl = price + atr_value * self.base_sl_atr
                 tp = price - atr_value * tp_multiplier
                 self.sell(sl=sl, tp=tp)
 
     def on_trade(self, trade):
         if trade.is_closed:
-            result = 1 if trade.pl > 0 else -1
-            self.trade_history.append(result)
-            if len(self.trade_history) > 2:
-                self.trade_history.pop(0)
+            ### MODIFICATION ###
+            # Simplified win streak counter.
+            if trade.pl > 0:
+                self.win_streak += 1
+            else:
+                self.win_streak = 0
 
-# --- 3. HTML Report and CSV Generation ---
 
+# --- 3. HTML Report and CSV Generation (Same as before) ---
 def generate_report_and_data(stats, commission_pips, filename="backtest_dashboard.html"):
     """Generates a polished HTML dashboard and simplified CSVs from the backtest results."""
 
@@ -284,7 +303,7 @@ def generate_report_and_data(stats, commission_pips, filename="backtest_dashboar
         <div class="container mx-auto p-4 sm:p-6 lg:p-8">
             <header class="mb-8 text-center">
                 <h1 class="text-3xl font-bold text-white">Backtest Performance Analysis</h1>
-                <p class="text-lg text-gray-400 mt-1">Strategy: Adaptive Volatility Breakout</p>
+                <p class="text-lg text-gray-400 mt-1">Strategy: Improved Adaptive Volatility Breakout</p>
             </header>
 
             <div class="card p-4 sm:p-6 mb-8">
@@ -349,9 +368,11 @@ if __name__ == '__main__':
         pip_value = 0.0001
         commission_per_side = (spread_pips * pip_value) / 2
 
-        bt = Backtest(df, AdaptiveBreakoutStrategy, cash=10_000, commission=commission_per_side, exclusive_orders=True)
+        ### MODIFICATION ###
+        # Using the new, improved strategy class
+        bt = Backtest(df, ImprovedAdaptiveBreakoutStrategy, cash=10_000, commission=commission_per_side, exclusive_orders=True)
 
-        print("Running backtest with Adaptive Volatility Breakout Strategy...")
+        print("Running backtest with Improved Adaptive Volatility Breakout Strategy...")
         stats = bt.run()
         print("\nBacktest Complete.")
         print("---")
@@ -359,19 +380,19 @@ if __name__ == '__main__':
         print(stats)
         print("---")
 
-        report_filename = "backtest_dashboard.html"
+        report_filename = "improved_backtest_dashboard.html"
         simplified_trades_df, simplified_stats_df = generate_report_and_data(stats, spread_pips, report_filename)
         print(f"✅ Polished dashboard saved to '{report_filename}'")
 
         # Save focused CSV files
         try:
             if not simplified_trades_df.empty:
-                simplified_trades_df.to_csv("trades_summary.csv", index=False)
-                print("📝 Simplified trades log saved to trades_summary.csv")
+                simplified_trades_df.to_csv("improved_trades_summary.csv", index=False)
+                print("📝 Simplified trades log saved to improved_trades_summary.csv")
 
             if not simplified_stats_df.empty:
-                simplified_stats_df.to_csv("stats_summary.csv", index=False)
-                print("📝 Simplified stats report saved to stats_summary.csv")
+                simplified_stats_df.to_csv("improved_stats_summary.csv", index=False)
+                print("📝 Simplified stats report saved to improved_stats_summary.csv")
         except Exception as e:
             print(f"Could not save summary CSV files: {e}")
 
